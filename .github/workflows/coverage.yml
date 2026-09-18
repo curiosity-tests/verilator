@@ -1,4 +1,3 @@
----
 # DESCRIPTION: Github actions config
 # SPDX-License-Identifier: LGPL-3.0-only OR Artistic-2.0
 
@@ -22,7 +21,7 @@ on:
         type: string
         default: ""
   schedule:
-    - cron: '0 0 * * 0'  # weekly
+  - cron: '0 0 * * 0'    # weekly
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
@@ -82,7 +81,7 @@ jobs:
         test: [coverage-vlt-, coverage-vltmt-]
         num: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         include:
-          - {test: coverage-dist, num: ''}
+        - {test: coverage-dist, num: ''}
 
   publish-codecov:
     continue-on-error: true   # racecar: scan job other jobs need
@@ -91,100 +90,172 @@ jobs:
     if: ${{ contains(needs.*.result, 'success') && !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Download code coverage data
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
-        with:
-          pattern: code-coverage-*
-          path: obj_coverage
-          merge-multiple: true
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Download code coverage data
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c    # v8
+      with:
+        pattern: code-coverage-*
+        path: obj_coverage
+        merge-multiple: true
 
-      - name: List files
-        id: list-files
-        run: |
-          ls -lsha obj_coverage
-          find obj_coverage -type f | paste -sd, | sed "s/^/files=/" >> "$GITHUB_OUTPUT"
+    - name: List files
+      id: list-files
+      run: |
+        ls -lsha obj_coverage
+        find obj_coverage -type f | paste -sd, | sed "s/^/files=/" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to codecov.io
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7
-        with:
-          disable_file_fixes: true
-          disable_search: true
-          fail_ci_if_error: true
-          files: ${{ steps.list-files.outputs.files }}
-          plugins: noop
-          token: ${{ secrets.CODECOV_TOKEN }}
-          verbose: true
+    - name: Upload to codecov.io
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f    # v7
+      with:
+        disable_file_fixes: true
+        disable_search: true
+        fail_ci_if_error: true
+        files: ${{ steps.list-files.outputs.files }}
+        plugins: noop
+        token: ${{ secrets.CODECOV_TOKEN }}
+        verbose: true
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   prepare-report:
     name: Prepare HTML report
     needs: [build, test]
     if: ${{ contains(needs.*.result, 'success') && !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Download repository archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
-        with:
-          name: ${{ needs.build.outputs.archive }}
-          path: ${{ github.workspace }}
+    - name: Download repository archive
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c    # v8
+      with:
+        name: ${{ needs.build.outputs.archive }}
+        path: ${{ github.workspace }}
 
-      - name: Unpack repository archive
-        run: |
-          tar --zstd -x -f ${{ needs.build.outputs.archive }}
-          ls -lsha
+    - name: Unpack repository archive
+      run: |
+        tar --zstd -x -f ${{ needs.build.outputs.archive }}
+        ls -lsha
 
-      - name: Install dependencies
-        uses: ./repo/.github/actions/install-deps
-        with:
-          stage: coverage
+    - name: Install dependencies
+      uses: ./repo/.github/actions/install-deps
+      with:
+        stage: coverage
 
-      - name: Download code coverage data
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
-        with:
-          pattern: code-coverage-*
-          path: repo/obj_coverage
-          merge-multiple: true
+    - name: Download code coverage data
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c    # v8
+      with:
+        pattern: code-coverage-*
+        path: repo/obj_coverage
+        merge-multiple: true
 
-      - name: Create report
-        working-directory: repo
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          ci/ci-coverage-report.bash \
-            ${{ github.run_id }} \
-            "${{ github.event_name == 'pull_request' && github.event.number || '' }}" \
-            "${{ github.event.pull_request.base.sha }}" \
-            "${{ github.event.pull_request.head.sha }}"
-          # Create the report artifact. Note there is no report if the patch is empty.
-          mkdir ../report-artifact
-          [ ! -d obj_coverage/report ] || mv obj_coverage/report ../report-artifact/
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo ${{ github.event.number }} > ../report-artifact/pr-number.txt
-          fi
+    - name: Create report
+      working-directory: repo
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        ci/ci-coverage-report.bash \
+          ${{ github.run_id }} \
+          "${{ github.event_name == 'pull_request' && github.event.number || '' }}" \
+          "${{ github.event.pull_request.base.sha }}" \
+          "${{ github.event.pull_request.head.sha }}"
+        # Create the report artifact. Note there is no report if the patch is empty.
+        mkdir ../report-artifact
+        [ ! -d obj_coverage/report ] || mv obj_coverage/report ../report-artifact/
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          echo ${{ github.event.number }} > ../report-artifact/pr-number.txt
+        fi
 
-      - name: Upload report
-        continue-on-error: true   # racecar: scan/report/push step, must not fail the build
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
-        with:
-          path: report-artifact
-          name: coverage-report
+    - name: Upload report
+      continue-on-error: true     # racecar: scan/report/push step, must not fail the build
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a    # v7
+      with:
+        path: report-artifact
+        name: coverage-report
 
-      - name: Upload PR notification
-        if: ${{ github.event_name == 'pull_request' }}
-        uses: ./repo/.github/actions/upload-pr-notification
-        with:
-          path: repo/notification
-          key: coverage
+    - name: Upload PR notification
+      if: ${{ github.event_name == 'pull_request' }}
+      uses: ./repo/.github/actions/upload-pr-notification
+      with:
+        path: repo/notification
+        key: coverage
 
   # Create GitHub issue for failed scheduled jobs
   # This should always be the last job (we want an issue if anything breaks)
@@ -195,24 +266,24 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       # Creating issues requires elevated privilege
-      - name: Generate access token
-        id: generate-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
-        with:
-          client-id: ${{ vars.VERILATOR_CI_ID }}
-          private-key: ${{ secrets.VERILATOR_CI_KEY }}
-          owner: verilator
-          repositories: verilator
-          permission-issues: write
-      - name: Create issue
-        env:
-          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
-        run: |-
-          echo "This issue was created automatically by the GitHub Actions CI due to the failure of a scheduled Code coverage run." >> body.txt
-          echo "" >> body.txt
-          echo "Workflow status: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> body.txt
-          gh issue --repo ${{ github.repository }} create \
-            --title "Code coverage run #${{ github.run_number }} Failed" \
-            --body-file body.txt \
-            --label new \
-            --assignee gezalore,wsnyder
+    - name: Generate access token
+      id: generate-token
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1    # v3.2.0
+      with:
+        client-id: ${{ vars.VERILATOR_CI_ID }}
+        private-key: ${{ secrets.VERILATOR_CI_KEY }}
+        owner: verilator
+        repositories: verilator
+        permission-issues: write
+    - name: Create issue
+      env:
+        GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+      run: |-
+        echo "This issue was created automatically by the GitHub Actions CI due to the failure of a scheduled Code coverage run." >> body.txt
+        echo "" >> body.txt
+        echo "Workflow status: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> body.txt
+        gh issue --repo ${{ github.repository }} create \
+          --title "Code coverage run #${{ github.run_number }} Failed" \
+          --body-file body.txt \
+          --label new \
+          --assignee gezalore,wsnyder
