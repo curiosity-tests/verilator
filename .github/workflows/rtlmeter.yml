@@ -7,8 +7,6 @@ name: RTLMeter
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 2 * * *'  # Daily, starting at 02:00 UTC
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   push:

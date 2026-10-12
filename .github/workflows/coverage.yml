@@ -20,8 +20,6 @@ on:
         description: "racecar correlation token, echoed into the run name"
         type: string
         default: ""
-  schedule:
-  - cron: '0 0 * * 0'    # weekly
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
